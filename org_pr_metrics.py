@@ -6,6 +6,7 @@
 #     "click",
 #     "rich",
 #     "pydantic>=2",
+#     "pydantic-settings[yaml]>=2.15",
 #     "pyyaml",
 #     "holidays",
 #     "pandas",
@@ -29,7 +30,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 from zoneinfo import ZoneInfo
 
 import click
@@ -39,7 +40,13 @@ import typer
 import typer.rich_utils
 import yaml
 from geopy.geocoders import Nominatim
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
 from rich.console import Console
 from tabulate import tabulate
 from timezonefinder import TimezoneFinder
@@ -142,15 +149,73 @@ def _cache_write(path: Path, version: int, data: dict) -> None:
 _geolocator = Nominatim(user_agent="gh-location-resolver")
 
 
-def load_people_config(path: Path) -> dict[str, dict]:
-    """Return per-login overrides ({login: {tz, country}}) from the people YAML."""
-    if not path.exists():
-        return {}
-    return (yaml.safe_load(path.read_text()) or {}).get("people") or {}
+class Person(BaseModel):
+    """One login's entry in the people config."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tz: str | None = Field(default=None, description="IANA timezone override")
+    country: str | None = Field(
+        default=None, description="Holiday country override (ISO 3166 alpha-2)"
+    )
+    aliases: list[str] = Field(
+        default_factory=list, description="Other GitHub logins of the same person"
+    )
+
+
+class PeopleConfig(BaseSettings):
+    """Per-login overrides and aliases, read from the people YAML file."""
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+    people: dict[str, Person] = Field(default_factory=dict)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return init_settings, YamlConfigSettingsSource(settings_cls)
+
+    @model_validator(mode="after")
+    def _aliases_name_one_person(self) -> Self:
+        seen: set[str] = set()
+        for person in self.people.values():
+            for alias in person.aliases:
+                if alias in seen or alias in self.people:
+                    raise ValueError(
+                        f"alias {alias} is listed twice or also has its own entry"
+                    )
+                seen.add(alias)
+        return self
+
+    def person(self, login: str) -> Person:
+        return self.people.get(login) or Person()
+
+    def alias_map(self) -> dict[str, str]:
+        """Return {alias login: main login}."""
+        return {
+            alias: login
+            for login, person in self.people.items()
+            for alias in person.aliases
+        }
+
+
+def load_people_config(path: Path) -> PeopleConfig:
+    """Load the people config from a YAML file; a missing file gives an empty config."""
+
+    class PeopleConfigFile(PeopleConfig):
+        model_config = SettingsConfigDict(yaml_file=path)
+
+    return PeopleConfigFile()
 
 
 def fetch_user_infos(
-    logins: set[str], org: str, overrides: dict[str, dict]
+    logins: set[str], org: str, people: PeopleConfig
 ) -> dict[str, dict]:
     """Return {login: user_info} for the given human logins."""
     info_map: dict[str, dict] = {}
@@ -165,7 +230,7 @@ def fetch_user_infos(
                 f"[bold green]Resolving timezones… {i}/{total} "
                 f"({cached_count} cached)[/bold green] {login}"
             )
-            info_map[login] = _fetch_user_info(login, org, overrides.get(login, {}))
+            info_map[login] = _fetch_user_info(login, org, people.person(login))
 
     by_country = Counter(u["country"] for u in info_map.values())
     console.print(
@@ -176,7 +241,7 @@ def fetch_user_infos(
     return info_map
 
 
-def _fetch_user_info(login: str, org: str, override: dict) -> dict:
+def _fetch_user_info(login: str, org: str, override: Person) -> dict:
     """Resolve a GitHub user's IANA timezone and holiday country.
 
     Timezone: people-config override, then the zone that best fits the user's
@@ -185,7 +250,7 @@ def _fetch_user_info(login: str, org: str, override: dict) -> dict:
     """
     cache_path = _user_cache_path(login)
     cached = _cache_read(cache_path, USER_CACHE_VERSION)
-    if cached is not None and not override:
+    if cached is not None and not (override.tz or override.country):
         return cached
 
     result = subprocess.run(
@@ -199,7 +264,7 @@ def _fetch_user_info(login: str, org: str, override: dict) -> dict:
     location = (profile.get("location") or "").strip() or None
     geo_country, geo_tz = _geocode_location(location) if location else (None, None)
 
-    tz, tz_method = override.get("tz"), "config"
+    tz, tz_method = override.tz, "config"
     if not tz:
         tz, tz_method = _infer_zone_from_commits(login, org), "commits"
     if not tz:
@@ -211,7 +276,7 @@ def _fetch_user_info(login: str, org: str, override: dict) -> dict:
         )
         raise SystemExit(1)
 
-    country, country_method = override.get("country"), "config"
+    country, country_method = override.country, "config"
     if not country:
         country, country_method = geo_country, "geocode"
     if not country:
@@ -302,8 +367,8 @@ def _infer_zone_from_commits(login: str, org: str) -> str | None:
     return best if scores[best] * 2 >= len(dates) else None
 
 
-def _is_bot(login: str | None) -> bool:
-    if not login:
+def _is_bot(login: str | float | None) -> bool:
+    if not isinstance(login, str) or not login:
         return True
     return login.endswith("[bot]") or login.lower() in BOT_LOGINS
 
@@ -319,6 +384,13 @@ class PRMetrics(BaseModel):
     number: int = Field(description="PR number within the repository")
     author: str | None = Field(
         default=None, description="GitHub login of the PR author"
+    )
+    person: str | None = Field(
+        default=None,
+        description=(
+            "Main login of the PR author: the login the author is an alias of "
+            "in the people config, else the author"
+        ),
     )
     author_country: str = Field(
         default=DEFAULT_COUNTRY,
@@ -770,6 +842,7 @@ def enrich_prs(
     user_info: dict[str, dict],
     files_map: dict[str, list[list]],
     ignore_globs: Sequence[str],
+    aliases: dict[str, str],
 ) -> list[PRMetrics]:
     enriched = []
     for pr in prs:
@@ -779,12 +852,14 @@ def enrich_prs(
             files_map.get(pr["url"], []), ignore_globs
         )
         author_login = (pr.get("author") or {}).get("login")
-        author = user_info.get(author_login) or _default_user_info()
+        person = aliases.get(author_login, author_login)
+        author = user_info.get(person) or _default_user_info()
         enriched.append(
             PRMetrics(
                 repo=f"{owner}/{repo}",
                 number=pr["number"],
                 author=author_login,
+                person=person,
                 author_country=author["country"],
                 author_tz=author["tz"],
                 title=pr["title"],
@@ -1225,12 +1300,13 @@ def users(
     ] = "",
     people_config: Annotated[
         Path,
-        typer.Option(help="YAML with per-login timezone/country overrides"),
+        typer.Option(help="YAML with per-login timezone/country overrides and aliases"),
     ] = DEFAULT_PEOPLE_CONFIG,
 ) -> None:
     """Fetch user info (location, timezone detection) for org members."""
     _clear_cache_if_requested(clear_cache)
-    overrides = load_people_config(people_config)
+    people = load_people_config(people_config)
+    aliases = people.alias_map()
 
     if login:
         logins = [s.strip() for s in login.split(",") if s.strip()]
@@ -1238,18 +1314,21 @@ def users(
         console.print(f"Fetching members of [bold]{org}[/bold]…")
         logins = _fetch_org_members(org)
         console.print(f"Found [bold]{len(logins)}[/bold] members.")
+    persons = sorted({aliases.get(user_login, user_login) for user_login in logins})
 
     results: list[dict] = []
     with console.status("") as status:
-        for i, user_login in enumerate(logins, 1):
+        for i, person in enumerate(persons, 1):
             status.update(
-                f"[bold green]Resolving user info… {i}/{len(logins)}[/bold green] "
-                f"{user_login}"
+                f"[bold green]Resolving user info… {i}/{len(persons)}[/bold green] "
+                f"{person}"
             )
-            info = _fetch_user_info(user_login, org, overrides.get(user_login, {}))
+            entry = people.person(person)
+            info = _fetch_user_info(person, org, entry)
             results.append(
                 {
-                    "login": user_login,
+                    "login": person,
+                    "aliases": entry.aliases,
                     "name": info.get("name"),
                     "location": info.get("location"),
                     "country": info["country"],
@@ -1261,7 +1340,7 @@ def users(
 
     by_country = Counter(r["country"] for r in results)
     console.print(
-        f"\nResolved [bold]{len(results)}[/bold] users: "
+        f"\nResolved [bold]{len(results)}[/bold] people: "
         + ", ".join(f"{n} {c}" for c, n in by_country.most_common())
     )
 
@@ -1271,10 +1350,20 @@ def users(
     method_parts = [f"{m}: {c}" for m, c in sorted(by_method.items())]
     console.print(f"Detection methods: {', '.join(method_parts)}")
 
-    headers = ["Login", "Name", "Location", "Country", "TZ", "TZ from", "Country from"]
+    headers = [
+        "Login",
+        "Aliases",
+        "Name",
+        "Location",
+        "Country",
+        "TZ",
+        "TZ from",
+        "Country from",
+    ]
     rows = [
         [
             r["login"],
+            ", ".join(r["aliases"]) or "—",
             r["name"] or "—",
             r["location"] or "—",
             r["country"],
@@ -1292,7 +1381,7 @@ def users(
             results, default_flow_style=False, sort_keys=False, allow_unicode=True
         )
     )
-    console.print(f"\nWrote [bold]{len(results)}[/bold] users to [cyan]{out}[/cyan]")
+    console.print(f"\nWrote [bold]{len(results)}[/bold] people to [cyan]{out}[/cyan]")
 
 
 @app.command()
@@ -1346,7 +1435,7 @@ def prs(
     ] = False,
     people_config: Annotated[
         Path,
-        typer.Option(help="YAML with per-login timezone/country overrides"),
+        typer.Option(help="YAML with per-login timezone/country overrides and aliases"),
     ] = DEFAULT_PEOPLE_CONFIG,
 ) -> None:
     """Gather lifecycle metrics for merged PRs in a GitHub org."""
@@ -1365,14 +1454,18 @@ def prs(
         *(ignore_path or []),
     ]
     details_map = fetch_pr_details(prs_data)
+    people = load_people_config(people_config)
+    aliases = people.alias_map()
     authors = {(pr.get("author") or {}).get("login") for pr in prs_data}
     user_info = fetch_user_infos(
-        {login for login in authors if not _is_bot(login)},
+        {aliases.get(login, login) for login in authors if not _is_bot(login)},
         org,
-        load_people_config(people_config),
+        people,
     )
     files_map = fetch_pr_files(prs_data)
-    enriched = enrich_prs(prs_data, details_map, user_info, files_map, ignore_globs)
+    enriched = enrich_prs(
+        prs_data, details_map, user_info, files_map, ignore_globs, aliases
+    )
     df = build_dataframe(enriched)
 
     def _normalize_repos(raw: str) -> set[str]:
@@ -1412,9 +1505,11 @@ def prs(
     display_size_stats(df, ignore_globs, summarize_ignored(in_scope, ignore_globs))
     write_yaml(df, out)
 
+    human_persons = df.loc[~df["author"].map(_is_bot), "person"]
     console.print(
         f"\n[bold]Summary:[/bold] {len(df)} merged PRs, "
-        f"{len(reviewed_df)} with human reviews (used in stats)"
+        f"{len(reviewed_df)} with human reviews (used in stats), "
+        f"{len(human_persons)} by {human_persons.nunique()} people"
     )
 
 
